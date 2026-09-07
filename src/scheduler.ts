@@ -1,66 +1,103 @@
-export type JobState = "queued" | "running" | "succeeded" | "failed";
+import { Job } from "./job.js";
 
-export interface JobSnapshot {
-  id: string;
-  state: JobState;
-  attempts: number;
+export interface SchedulerOptions {
+  maxConcurrency: number;
+  maxRetries?: number;
 }
 
-type JobTask = () => Promise<void>;
+interface QueueEntry<T = unknown> {
+  job: Job<T>;
+  retriesRemaining: number;
+}
 
-type InternalJob = {
-  id: string;
-  task: JobTask;
-  state: JobState;
-  attempts: number;
-};
+export class JobScheduler {
+  private readonly queue: QueueEntry[] = [];
+  private readonly running = new Set<Promise<void>>();
+  private readonly maxConcurrency: number;
+  private readonly maxRetries: number;
 
-export class AsyncJobScheduler {
-  private readonly jobs: InternalJob[] = [];
-
-  constructor(
-    private readonly maxConcurrency: number,
-    private readonly maxRetries = 0,
-  ) {
-    if (maxConcurrency < 1) {
-      throw new Error("maxConcurrency must be at least 1");
+  constructor(options: SchedulerOptions) {
+    if (!Number.isInteger(options.maxConcurrency)) {
+      throw new Error("maxConcurrency must be an integer");
     }
-    if (maxRetries < 0) {
-      throw new Error("maxRetries cannot be negative");
+
+    if (options.maxConcurrency < 1) {
+      throw new Error("maxConcurrency must be greater than zero");
     }
+
+    if (
+      options.maxRetries !== undefined &&
+      (!Number.isInteger(options.maxRetries) ||
+        options.maxRetries < 0)
+    ) {
+      throw new Error(
+        "maxRetries must be a non-negative integer",
+      );
+    }
+
+    this.maxConcurrency = options.maxConcurrency;
+    this.maxRetries = options.maxRetries ?? 0;
   }
 
-  enqueue(id: string, task: JobTask): void {
-    if (this.jobs.some((job) => job.id === id)) {
-      throw new Error(`duplicate job id: ${id}`);
-    }
-    this.jobs.push({ id, task, state: "queued", attempts: 0 });
+  enqueue<T>(job: Job<T>): void {
+    this.queue.push({
+      job,
+      retriesRemaining: this.maxRetries,
+    });
   }
 
-  snapshot(): JobSnapshot[] {
-    return this.jobs.map(({ id, state, attempts }) => ({ id, state, attempts }));
+  get queuedCount(): number {
+    return this.queue.length;
+  }
+
+  get runningCount(): number {
+    return this.running.size;
   }
 
   async drain(): Promise<void> {
-    while (true) {
-      const queued = this.jobs.filter((job) => job.state === "queued");
-      if (queued.length === 0) return;
+    while (
+      this.queue.length > 0 ||
+      this.running.size > 0
+    ) {
+      this.startAvailableJobs();
 
-      const batch = queued.slice(0, this.maxConcurrency);
-      await Promise.all(batch.map((job) => this.run(job)));
+      if (this.running.size > 0) {
+        await Promise.race(this.running);
+      }
     }
   }
 
-  private async run(job: InternalJob): Promise<void> {
-    job.state = "running";
-    job.attempts += 1;
+  private startAvailableJobs(): void {
+    while (
+      this.running.size < this.maxConcurrency &&
+      this.queue.length > 0
+    ) {
+      const entry = this.queue.shift();
 
+      if (!entry) {
+        return;
+      }
+
+      const execution = this.execute(entry);
+      this.running.add(execution);
+
+      execution.finally(() => {
+        this.running.delete(execution);
+      });
+    }
+  }
+
+  private async execute(entry: QueueEntry): Promise<void> {
     try {
-      await job.task();
-      job.state = "succeeded";
+      await entry.job.run();
     } catch {
-      const retriesUsed = job.attempts - 1;
-      job.state = retriesUsed < this.maxRetries ? "queued" : "failed";
+      if (entry.retriesRemaining > 0) {
+        entry.retriesRemaining -= 1;
+
+        entry.job.resetForRetry();
+
+        this.queue.push(entry);
+      }
     }
   }
 }
