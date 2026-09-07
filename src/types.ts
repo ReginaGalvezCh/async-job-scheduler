@@ -17,3 +17,7 @@ export interface JobSnapshot<T = unknown> {
   result?: T;
   error?: unknown;
 }
+
+export interface EnqueueOptions {
+  priority?: number;
+}

@@ -10,11 +10,18 @@ interface QueueEntry<T = unknown> {
   retriesRemaining: number;
 }
 
+interface QueueEntry<T = unknown> {
+  job: Job<T>;
+  retriesRemaining: number;
+  priority: number;
+  sequence: number;
+}
 export class JobScheduler {
   private readonly queue: QueueEntry[] = [];
   private readonly running = new Set<Promise<void>>();
   private readonly maxConcurrency: number;
   private readonly maxRetries: number;
+  private sequence = 0;
 
   constructor(options: SchedulerOptions) {
     if (!Number.isInteger(options.maxConcurrency)) {
@@ -39,11 +46,19 @@ export class JobScheduler {
     this.maxRetries = options.maxRetries ?? 0;
   }
 
-  enqueue<T>(job: Job<T>): void {
-    this.queue.push({
+  enqueue<T>(
+    job: Job<T>,
+    options: { priority?: number } = {},
+  ): void {
+    const entry: QueueEntry<T> = {
       job,
       retriesRemaining: this.maxRetries,
-    });
+      priority: options.priority ?? 0,
+      sequence: this.sequence++,
+    };
+
+    this.queue.push(entry);
+    this.sortQueue();
   }
 
   get queuedCount(): number {
@@ -93,11 +108,21 @@ export class JobScheduler {
     } catch {
       if (entry.retriesRemaining > 0) {
         entry.retriesRemaining -= 1;
-
+        this.sortQueue();
         entry.job.resetForRetry();
 
         this.queue.push(entry);
       }
     }
+  }
+
+  private sortQueue(): void {
+    this.queue.sort((a, b) => {
+      if (a.priority !== b.priority) {
+        return b.priority - a.priority;
+      }
+
+      return a.sequence - b.sequence;
+    });
   }
 }
